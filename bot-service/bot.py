@@ -5,12 +5,19 @@ Robust NSFW moderation Telegram bot (aiogram v3)
 - Calls model at MODEL_API_URL (/score) with Authorization Bearer MODEL_SECRET
 - If score >= NSFW_THRESHOLD -> delete message, mute user permanently, log offense
 - Defensive error handling so single handler exceptions don't stop processing
+
+Added:
+- per-chat whitelist stored in sqlite
+- /whitelist (toggle by reply or numeric id) — admin-only
+- /whitelisted (list for this chat)
+- /unmute supports reply (admin/owner) or /unmute <chat_id> <user_id> (owner-only)
 """
 import os
 import io
 import logging
 import asyncio
 import sqlite3
+import html
 from typing import Optional
 
 import httpx
@@ -19,6 +26,7 @@ from aiogram.types import ChatPermissions
 from aiogram import F
 from aiogram.enums import ContentType
 from aiogram.filters import Command
+from aiogram.enums import ChatMemberStatus
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -58,6 +66,16 @@ CREATE TABLE IF NOT EXISTS offenders (
     offenses INTEGER NOT NULL DEFAULT 1,
     muted INTEGER NOT NULL DEFAULT 0,
     last_offense_ts INTEGER DEFAULT (strftime('%s','now'))
+)
+"""
+)
+# Whitelist table: per-chat whitelist entries
+_conn.execute(
+    """
+CREATE TABLE IF NOT EXISTS whitelist (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
 )
 """
 )
@@ -103,6 +121,45 @@ def get_offenses(chat_id: int, user_id: int) -> int:
         return 0
 
 
+# ---------- whitelist helpers ----------
+def add_whitelist(chat_id: int, user_id: int):
+    try:
+        cur = _conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO whitelist (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
+        _conn.commit()
+    except Exception:
+        logger.exception("DB error in add_whitelist")
+
+
+def remove_whitelist(chat_id: int, user_id: int):
+    try:
+        cur = _conn.cursor()
+        cur.execute("DELETE FROM whitelist WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        _conn.commit()
+    except Exception:
+        logger.exception("DB error in remove_whitelist")
+
+
+def is_whitelisted(chat_id: int, user_id: int) -> bool:
+    try:
+        cur = _conn.cursor()
+        cur.execute("SELECT 1 FROM whitelist WHERE chat_id=? AND user_id=? LIMIT 1", (chat_id, user_id))
+        return cur.fetchone() is not None
+    except Exception:
+        logger.exception("DB error in is_whitelisted")
+        return False
+
+
+def list_whitelisted(chat_id: int):
+    try:
+        cur = _conn.cursor()
+        cur.execute("SELECT user_id FROM whitelist WHERE chat_id=? ORDER BY user_id", (chat_id,))
+        return [row[0] for row in cur.fetchall()]
+    except Exception:
+        logger.exception("DB error in list_whitelisted")
+        return []
+
+
 # ---------- bot setup ----------
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
@@ -138,12 +195,33 @@ async def download_file_bytes(file_id: str, timeout: float = 30.0) -> bytes:
 # ---------- model call helper ----------
 async def get_image_score(image_bytes: bytes, filename: str = "image.jpg", timeout: float = 30.0) -> float:
     headers = {"Authorization": f"Bearer {MODEL_SECRET}"} if MODEL_SECRET else {}
+    # model expects field name "image" in current repo; adjust if needed
     files = {"image": (filename, image_bytes, "image/jpeg")}
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(MODEL_API_URL, headers=headers, files=files)
     resp.raise_for_status()
     data = resp.json()
-    return float(data.get("score", 0.0))
+    # support multiple keys
+    if isinstance(data, dict):
+        if "score" in data:
+            return float(data.get("score", 0.0))
+        if "prediction" in data:
+            return float(data.get("prediction", 0.0))
+    # fallback: try to parse first numeric value
+    try:
+        return float(data)
+    except Exception:
+        return 0.0
+
+
+# ---------- helper: check admin ----------
+async def is_chat_admin(chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.CREATOR)
+    except Exception:
+        logger.exception("is_chat_admin check failed")
+        return False
 
 
 # ---------- image handler logic ----------
@@ -152,6 +230,11 @@ async def handle_media(message: types.Message):
     try:
         user = message.from_user
         chat = message.chat
+
+        # If sender is whitelisted for this chat, skip
+        if user and is_whitelisted(chat.id, user.id):
+            logger.info("Skipping scan for whitelisted user %s in chat %s", user.id, chat.id)
+            return
 
         # download image bytes
         image_bytes = None
@@ -241,7 +324,7 @@ async def handle_media(message: types.Message):
                     chat_title = chat.title or str(chat.id)
                     await bot.send_message(
                         OWNER_CHAT_ID,
-                        f"Muted user <a href='tg://user?id={user.id}'>{user.id}</a> in {chat_title}\nscore={score:.3f}\noffenses={offenses}",
+                        f"Muted user <a href='tg://user?id={user.id}'>{html.escape(str(user.id))}</a> in {html.escape(chat_title)}\nscore={score:.3f}\noffenses={offenses}",
                     )
                 except Exception:
                     logger.exception("Failed to notify owner about mute")
@@ -289,20 +372,117 @@ async def cmd_status(message: types.Message):
         logger.exception("cmd_status reply failed")
 
 
+# ---------- whitelist commands ----------
+@dp.message(Command("whitelist"))
+async def cmd_whitelist(message: types.Message):
+    """
+    Toggle whitelist for a user.
+    Usage:
+      - Reply to user's message with /whitelist  -> toggles that user's whitelist state in this chat (admin-only)
+      - /whitelist <user_id>                    -> toggles given user in this chat (admin-only)
+    """
+    try:
+        chat_id = message.chat.id
+        requester = message.from_user.id
+
+        # Only admins can change whitelist
+        if not await is_chat_admin(chat_id, requester):
+            await message.reply("Only chat admins can change the whitelist.")
+            return
+
+        target_user_id: Optional[int] = None
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_user_id = message.reply_to_message.from_user.id
+        else:
+            args = (message.get_command_arguments() or "").strip()
+            if args:
+                # accept numeric id (not @username resolution here to keep simple)
+                try:
+                    target_user_id = int(args.split()[0])
+                except ValueError:
+                    await message.reply("Please reply to a user or provide numeric user id to whitelist.", parse_mode="HTML")
+                    return
+            else:
+                await message.reply("Usage: reply to a user with /whitelist or /whitelist <user_id>", parse_mode="HTML")
+                return
+
+        if is_whitelisted(chat_id, target_user_id):
+            remove_whitelist(chat_id, target_user_id)
+            await message.reply(f"User <a href='tg://user?id={target_user_id}'>{html.escape(str(target_user_id))}</a> removed from whitelist for this chat.", parse_mode="HTML")
+        else:
+            add_whitelist(chat_id, target_user_id)
+            await message.reply(f"User <a href='tg://user?id={target_user_id}'>{html.escape(str(target_user_id))}</a> added to whitelist for this chat. Their images will not be scanned.", parse_mode="HTML")
+    except Exception:
+        logger.exception("cmd_whitelist failed")
+
+
+@dp.message(Command("whitelisted"))
+async def cmd_whitelisted(message: types.Message):
+    """
+    List whitelisted users for this chat.
+    """
+    try:
+        chat_id = message.chat.id
+        entries = list_whitelisted(chat_id)
+        if not entries:
+            await message.reply("No whitelisted users for this chat.")
+            return
+        lines = []
+        for uid in entries:
+            lines.append(f"<a href='tg://user?id={uid}'>{html.escape(str(uid))}</a>")
+        await message.reply("Whitelisted users:\n" + "\n".join(lines), parse_mode="HTML")
+    except Exception:
+        logger.exception("cmd_whitelisted failed")
+
+
+# ---------- unmute command (reply-friendly) ----------
 @dp.message(Command("unmute"))
 async def cmd_unmute(message: types.Message):
+    """
+    Unmute a user.
+    Usage:
+      - Reply to a muted user's message and send /unmute  -> works for chat admins or owner
+      - /unmute <chat_id> <user_id>                     -> owner-only (cross-chat)
+    """
     try:
-        if message.from_user and message.from_user.id != OWNER_CHAT_ID:
-            await message.reply("Only owner can use this command.")
+        requester = message.from_user
+        # If reply -> allow chat admin or owner to unmute in that chat
+        if message.reply_to_message and message.reply_to_message.from_user:
+            chat_id = message.chat.id
+            user_id = message.reply_to_message.from_user.id
+
+            # allow owner or chat admin
+            if requester.id != OWNER_CHAT_ID and not await is_chat_admin(chat_id, requester.id):
+                await message.reply("Only chat admins (or owner) can unmute by reply.")
+                return
+
+            try:
+                await bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True),
+                    until_date=None,
+                )
+                cur = _conn.cursor()
+                cur.execute("UPDATE offenders SET muted=0, offenses=0 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+                _conn.commit()
+                await message.reply(f"User <a href='tg://user?id={user_id}'>{html.escape(str(user_id))}</a> unmuted in this chat.", parse_mode="HTML")
+            except Exception:
+                logger.exception("Failed to unmute user by reply")
+                await message.reply("Failed to unmute (bot needs admin or user not found).")
             return
-        parts = message.text.split()
-        if len(parts) < 3:
-            # Escape angle brackets so global HTML parse_mode doesn't fail
-            await message.reply("Usage: /unmute &lt;chat_id&gt; &lt;user_id&gt;")
+
+        # else check owner-only usage: /unmute <chat_id> <user_id>
+        parts = (message.get_command_arguments() or "").split()
+        if requester.id != OWNER_CHAT_ID:
+            await message.reply("To unmute by IDs you must be the owner.")
+            return
+        if len(parts) < 2:
+            await message.reply("Usage (owner): /unmute <chat_id> <user_id>")
             return
         try:
-            chat_id = int(parts[1])
-            user_id = int(parts[2])
+            chat_id = int(parts[0])
+            user_id = int(parts[1])
         except ValueError:
             await message.reply("Chat ID and User ID must be integers.")
             return
@@ -316,9 +496,9 @@ async def cmd_unmute(message: types.Message):
             cur = _conn.cursor()
             cur.execute("UPDATE offenders SET muted=0, offenses=0 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
             _conn.commit()
-            await message.reply(f"User {user_id} unmuted in chat {chat_id}.")
+            await message.reply(f"User <a href='tg://user?id={user_id}'>{html.escape(str(user_id))}</a> unmuted in chat {html.escape(str(chat_id))}.", parse_mode="HTML")
         except Exception:
-            logger.exception("Failed to unmute user")
+            logger.exception("Failed to unmute by id")
             await message.reply("Failed to unmute (bot needs admin or invalid IDs).")
     except Exception:
         logger.exception("cmd_unmute unexpected error")
