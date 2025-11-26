@@ -1,7 +1,5 @@
 aiogram==3.1.0
 httpx==0.24.1
 python-dotenv==1.0.0
-python-multipart==0.0.6
 Pillow==9.5.0
-uvicorn==0.22.0
-numpy
+numpy==1.26.0
