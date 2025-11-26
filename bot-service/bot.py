@@ -1,7 +1,7 @@
 # bot-service/bot.py
 """
 Telegram moderation bot (aiogram v3)
-- Downloads incoming images (photo/document)
+- Downloads incoming images (photo/document) via Telegram getFile endpoint
 - Sends image bytes to MODEL_API_URL (Authorization: Bearer <MODEL_SECRET>)
 - If score >= NSFW_THRESHOLD -> delete message, mute user permanently, log offense
 - Notifies OWNER_CHAT_ID about actions and model errors
@@ -18,7 +18,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import ChatPermissions
 from aiogram import F
 from aiogram.enums import ContentType
-from aiogram.filters import Command  # correct filter for commands in aiogram v3
+from aiogram.filters import Command  # correct for aiogram v3
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -44,7 +44,6 @@ if not MODEL_SECRET:
 
 # ---------- sqlite (simple file inside /data or /app) ----------
 DB_PATH = os.getenv("BOT_DB_PATH", "/data/bot_state.sqlite3")
-# ensure directory exists
 try:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 except Exception:
@@ -102,6 +101,32 @@ dp = Dispatcher()
 PERMANENT_UNTIL = 2147483647
 
 
+# ---------- helper: download file bytes via Telegram API ----------
+async def download_file_bytes(file_id: str, timeout: float = 30.0) -> bytes:
+    """
+    Uses Telegram Bot API getFile -> download file via file path.
+    Returns raw bytes of the file.
+    """
+    # Step 1: get file_path
+    getfile_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(getfile_url, params={"file_id": file_id})
+        resp.raise_for_status()
+        j = resp.json()
+    if not j.get("ok") or "result" not in j:
+        raise RuntimeError(f"getFile failed: {j}")
+    file_path = j["result"].get("file_path")
+    if not file_path:
+        raise RuntimeError("getFile returned empty file_path")
+
+    # Step 2: download actual file content
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        file_resp = await client.get(file_url)
+        file_resp.raise_for_status()
+        return file_resp.content
+
+
 # ---------- model call helper ----------
 async def get_image_score(image_bytes: bytes, filename: str = "image.jpg", timeout: float = 30.0) -> float:
     headers = {"Authorization": f"Bearer {MODEL_SECRET}"} if MODEL_SECRET else {}
@@ -118,27 +143,30 @@ async def handle_media(message: types.Message):
     user = message.from_user
     chat = message.chat
 
-    # download image bytes from photo or document
+    # download image bytes from photo or document using download_file_bytes helper
     image_bytes = None
     filename = "image.jpg"
     try:
         if message.photo:
-            buf = io.BytesIO()
-            await message.photo[-1].download(destination=buf)
-            buf.seek(0)
-            image_bytes = buf.read()
+            # use the highest resolution photo's file_id
+            file_id = message.photo[-1].file_id
+            image_bytes = await download_file_bytes(file_id)
             filename = "photo.jpg"
         elif message.document and (message.document.mime_type or "").startswith("image"):
-            buf = io.BytesIO()
-            await message.document.download(destination=buf)
-            buf.seek(0)
-            image_bytes = buf.read()
+            file_id = message.document.file_id
+            image_bytes = await download_file_bytes(file_id)
             filename = message.document.file_name or "document.jpg"
         else:
             # not an image, ignore
             return
     except Exception:
         logger.exception("Failed to download file from Telegram")
+        # optional: notify owner on repeated errors
+        if OWNER_CHAT_ID:
+            try:
+                await bot.send_message(OWNER_CHAT_ID, f"Failed to download file from Telegram for chat {chat.id}. See logs.")
+            except Exception:
+                pass
         return
 
     if not image_bytes:
@@ -150,7 +178,6 @@ async def handle_media(message: types.Message):
         score = await get_image_score(image_bytes, filename=filename)
     except httpx.HTTPStatusError as e:
         logger.error("Model API returned status %s: %s", e.response.status_code, e.response.text)
-        # notify owner about model error
         if OWNER_CHAT_ID:
             try:
                 await bot.send_message(OWNER_CHAT_ID, f"Model API error: {e.response.status_code} {e.response.text}")
@@ -211,7 +238,6 @@ async def handle_media(message: types.Message):
             except Exception:
                 pass
     else:
-        # optional: you may log or do nothing for safe images
         logger.debug("Image OK (score %.3f) for user %s in chat %s", score, user.id, chat.id)
 
 
@@ -234,7 +260,6 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
-    # owner-only
     if message.from_user and message.from_user.id == OWNER_CHAT_ID:
         await message.reply("Bot is running.")
     else:
@@ -243,7 +268,6 @@ async def cmd_status(message: types.Message):
 
 @dp.message(Command("unmute"))
 async def cmd_unmute(message: types.Message):
-    # owner-only: /unmute <chat_id> <user_id>
     if message.from_user and message.from_user.id != OWNER_CHAT_ID:
         await message.reply("Only owner can use this command.")
         return
@@ -264,7 +288,6 @@ async def cmd_unmute(message: types.Message):
             permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True),
             until_date=None,
         )
-        # reset DB mute flag
         cur = _conn.cursor()
         cur.execute("UPDATE offenders SET muted=0, offenses=0 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
         _conn.commit()
