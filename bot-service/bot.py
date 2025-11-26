@@ -2,133 +2,96 @@
 import os
 import logging
 import asyncio
+import httpx
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ChatPermissions
-from aiogram.filters import Command
-from aiogram.enums import ContentType
-from aiogram.utils import exceptions
-from db import add_offense, mark_muted, get_offenses
-from utils import get_image_score
+from aiogram.filters import MessageType
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("bridge-bot")
+logger = logging.getLogger("bot-service")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MODEL_API_URL = os.environ.get("MODEL_API_URL")  # full: https://<model-host>/score
+MODEL_SECRET = os.environ.get("MODEL_SECRET", "mgPROTECT12345")
+NSFW_THRESHOLD = float(os.environ.get("NSFW_THRESHOLD", "0.65"))
+MUTE_DAYS = int(os.environ.get("MUTE_DAYS", "999"))
+OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0"))
+
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env var is required")
-
-NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.75"))
-MUTE_DAYS = int(os.getenv("MUTE_DAYS", "0"))  # 0 -> permanent
-OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
+    logger.error("BOT_TOKEN not set in environment. Exiting.")
+    raise SystemExit(1)
+if not MODEL_API_URL:
+    logger.error("MODEL_API_URL not set in environment. Exiting.")
+    raise SystemExit(1)
 
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-# Helper: mute until far future (year 2038 max for int32)
-PERMANENT_UNTIL = 2147483647
+async def send_image_to_model_and_get_score(image_bytes: bytes) -> float:
+    headers = {"Authorization": f"Bearer {MODEL_SECRET}"}
+    files = {"image": ("image.jpg", image_bytes, "image/jpeg")}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(MODEL_API_URL, headers=headers, files=files)
+    if resp.status_code != 200:
+        logger.error("Model API returned %s: %s", resp.status_code, resp.text)
+        raise RuntimeError(f"Model API returned {resp.status_code}")
+    data = resp.json()
+    return float(data.get("score", 0.0))
 
-async def handle_media(message: types.Message):
-    # Accept photos and documents that are images
-    user = message.from_user
-    chat = message.chat
-
-    # fetch image bytes depending on type
-    file_bytes = None
-    filename = "image.jpg"
+@dp.message(MessageType.PHOTO)
+async def handle_photo(message: types.Message):
     try:
-        if message.photo:
-            file = await bot.get_file(message.photo[-1].file_id)
-            file_bytes = await bot.download_file(file.file_path)
-            filename = "photo.jpg"
-        elif message.document and (message.document.mime_type or "").startswith("image"):
-            file = await bot.get_file(message.document.file_id)
-            file_bytes = await bot.download_file(file.file_path)
-            filename = message.document.file_name or "doc.jpg"
-        else:
-            return  # not an image
-    except Exception:
-        logger.exception("Failed to download file from Telegram")
-        return
-
-    # convert to bytes
-    if hasattr(file_bytes, "read"):
-        img_bytes = file_bytes.read()
-    elif isinstance(file_bytes, (bytes, bytearray)):
-        img_bytes = bytes(file_bytes)
-    else:
-        # fallback: attempt to call .content
-        img_bytes = getattr(file_bytes, "content", b"")
-
-    if not img_bytes:
-        logger.warning("No bytes for image; skipping.")
-        return
-
-    # Call model-service
-    try:
-        score = await get_image_score(img_bytes, filename=filename)
+        # get highest quality photo
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        b = await bot.download_file(file.file_path)
+        image_bytes = b.read()
     except Exception as e:
-        logger.exception("Model API call failed")
+        logger.exception("Failed to download photo")
         return
 
-    logger.info("Image score for %s/%s: %s", chat.id, user.id, score)
+    try:
+        score = await send_image_to_model_and_get_score(image_bytes)
+    except Exception as e:
+        logger.exception("Error calling model API: %s", e)
+        try:
+            await bot.send_message(OWNER_CHAT_ID, f"Model API error: {e}")
+        except Exception:
+            pass
+        return
 
+    logger.info("NSFW score for message %s by %s = %.3f", message.message_id, message.from_user.id, score)
     if score >= NSFW_THRESHOLD:
-        # Delete message
+        # delete message
         try:
-            await bot.delete_message(chat.id, message.message_id)
-        except exceptions.MessageCantBeDeleted:
-            logger.warning("No permission to delete message in chat %s", chat.id)
+            await bot.delete_message(message.chat.id, message.message_id)
         except Exception:
-            logger.exception("Failed deleting message")
+            logger.exception("Failed to delete message")
 
-        # increment offense and mute user permanently
-        offenses = add_offense(chat.id, user.id)
+        # restrict user (mute) — permanent if platform allows None, else set far future
         try:
-            # restrict permissions: no send messages, no media
+            until_date = None  # aiogram / Bot API may accept None for permanent
             await bot.restrict_chat_member(
-                chat_id=chat.id,
-                user_id=user.id,
-                permissions=ChatPermissions(can_send_messages=False, can_send_media_messages=False, can_send_other_messages=False, can_add_web_page_previews=False),
-                until_date=PERMANENT_UNTIL
+                chat_id=message.chat.id,
+                user_id=message.from_user.id,
+                permissions=ChatPermissions(can_send_messages=False,
+                                            can_send_media_messages=False,
+                                            can_send_other_messages=False,
+                                            can_add_web_page_previews=False),
+                until_date=until_date
             )
-            mark_muted(chat.id, user.id)
-        except exceptions.ChatAdminRequired:
-            logger.warning("Bot needs admin privileges to mute in chat %s", chat.id)
-            # notify owner
-            if OWNER_CHAT_ID:
-                await bot.send_message(OWNER_CHAT_ID, f"Need admin to mute user {user.id} in chat {chat.id}.")
         except Exception:
-            logger.exception("Failed to restrict user")
+            logger.exception("Failed to restrict (mute) user")
 
-        # notify owner optionally
-        if OWNER_CHAT_ID:
-            try:
-                await bot.send_message(OWNER_CHAT_ID, f"User <a href='tg://user?id={user.id}'>{user.id}</a> was muted in chat {chat.id} for NSFW image (score={score:.2f}). Offenses={offenses}")
-            except Exception:
-                logger.exception("Failed to notify owner")
-
-@dp.message(Command(commands=["start"]))
-async def start_cmd(message: types.Message):
-    await message.reply("NSFW moderation bot active. I delete vulgar images and mute offenders.")
-
-# Register handlers for photos and documents
-@dp.message(F.content_type == ContentType.PHOTO)
-async def photo_handler(message: types.Message):
-    await handle_media(message)
-
-@dp.message(F.content_type == ContentType.DOCUMENT)
-async def document_handler(message: types.Message):
-    # only image documents
-    if message.document and (message.document.mime_type or "").startswith("image"):
-        await handle_media(message)
-
-# Include admin router
-from admin_handlers import router as admin_router
-dp.include_router(admin_router)
+        # notify owner
+        try:
+            await bot.send_message(OWNER_CHAT_ID,
+                                   f"Deleted NSFW image from {message.from_user.id} in {message.chat.title or message.chat.id}. Score: {score:.3f}")
+        except Exception:
+            pass
 
 async def main():
     try:
-        logger.info("Starting bot polling...")
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
