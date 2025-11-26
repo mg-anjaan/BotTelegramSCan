@@ -1,241 +1,240 @@
-# bot.py - NSFW Moderation Bot using HuggingFace API
+#!/usr/bin/env python3
+"""
+Telegram NSFW Scanner Bot (HuggingFace-powered)
+- Detects porn, hentai, explicit, sexy, NSFW
+- Deletes image, permanently mutes offender
+- Logs score
+- Stable & lightweight (aiogram v3)
+"""
+
 import os
 import io
 import logging
 import asyncio
-import sqlite3
-from typing import Optional
-
 import httpx
-from aiogram import Bot, Dispatcher, types
+import sqlite3
+
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ContentType
-from aiogram.types import ChatPermissions
 from aiogram.filters import Command
-from aiogram import F
+from aiogram.types import ChatPermissions
 
 # -------------------- Logging --------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nsfw-moderator")
 
-# -------------------- Environment Variables --------------------
+# -------------------- ENV ------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-HF_TOKEN = os.getenv("HF_TOKEN")  # HuggingFace token
-OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0") or 0)
-NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.70"))  # default 0.7
-MUTE_DAYS = int(os.getenv("MUTE_DAYS", "9999"))
+OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
+NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.65"))
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN not set!")
-
+    raise SystemExit("BOT_TOKEN missing")
 if not HF_TOKEN:
-    raise SystemExit("❌ HF_TOKEN (HuggingFace API Key) not set!")
+    raise SystemExit("HF_TOKEN missing (HuggingFace Access Token)")
 
-# HuggingFace model
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/Falconsai/nsfw_image_detection"
-HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+# -------------------- Database -------------------
+DB_PATH = "/data/nsfw.sqlite3"
+os.makedirs("/data", exist_ok=True)
 
-# -------------------- SQLite DB --------------------
-DB_PATH = os.getenv("BOT_DB_PATH", "/data/bot_state.sqlite3")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-
-_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-
-_conn.execute("""
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn.execute("""
 CREATE TABLE IF NOT EXISTS offenders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    offenses INTEGER NOT NULL DEFAULT 1,
-    muted INTEGER NOT NULL DEFAULT 0,
-    last_offense_ts INTEGER DEFAULT (strftime('%s','now'))
+    chat_id INTEGER,
+    user_id INTEGER,
+    offenses INTEGER DEFAULT 1,
+    muted INTEGER DEFAULT 0
 )
 """)
-_conn.commit()
+conn.commit()
 
 
-def add_offense(chat_id: int, user_id: int) -> int:
-    cur = _conn.cursor()
-    cur.execute("SELECT id, offenses FROM offenders WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+def add_offense(chat_id, user_id):
+    cur = conn.cursor()
+    cur.execute("SELECT offenses FROM offenders WHERE chat_id=? AND user_id=?", (chat_id, user_id))
     row = cur.fetchone()
+
     if row:
-        _id, offenses = row
-        offenses += 1
-        cur.execute("UPDATE offenders SET offenses=?, last_offense_ts=strftime('%s','now') WHERE id=?", (offenses, _id))
+        offenses = row[0] + 1
+        cur.execute("UPDATE offenders SET offenses=? WHERE chat_id=? AND user_id=?", (offenses, chat_id, user_id))
     else:
         offenses = 1
-        cur.execute("INSERT INTO offenders (chat_id,user_id,offenses) VALUES (?,?,?)",
-                    (chat_id, user_id, offenses))
-    _conn.commit()
+        cur.execute("INSERT INTO offenders(chat_id, user_id, offenses) VALUES (?,?,1)", (chat_id, user_id))
+
+    conn.commit()
     return offenses
 
 
-def mark_muted(chat_id: int, user_id: int):
-    cur = _conn.cursor()
-    cur.execute("UPDATE offenders SET muted=1 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-    _conn.commit()
+def reset_user(chat_id, user_id):
+    conn.execute("UPDATE offenders SET offenses=0, muted=0 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    conn.commit()
 
 
-# -------------------- Telegram Bot Setup --------------------
+# -------------------- Bot Setup ------------------
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-PERMANENT_UNTIL = 2147483647  # max timestamp
+PERMANENT_UNTIL = 2147483647  # almost permanent Unix timestamp
 
 
-# -------------------- Image Score Using HuggingFace --------------------
-async def get_hf_score(image_bytes: bytes) -> float:
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(HF_MODEL_URL, headers=HF_HEADERS, files={"file": image_bytes})
-
-    if resp.status_code != 200:
-        logger.error(f"HuggingFace error: {resp.status_code} {resp.text}")
-        return 0.0
-
-    data = resp.json()
-    # Expected output: list of dicts → pick NSFW score
-    try:
-        for item in data:
-            if item["label"].lower() in ["porn", "nsfw", "sexy", "hentai"]:
-                return float(item["score"])
-        return 0.0
-    except:
-        logger.error("Unexpected HuggingFace response format")
-        return 0.0
-
-
-# -------------------- Telegram File Download --------------------
-async def tg_download(file_id: str) -> bytes:
-    getfile = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.get(getfile, params={"file_id": file_id})
+# -------------------- Download Telegram File --------------------
+async def download_file(file_id: str) -> bytes:
+    get_file_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(get_file_url, params={"file_id": file_id})
         r.raise_for_status()
-        file_path = r.json()["result"]["file_path"]
+        path = r.json()["result"]["file_path"]
 
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    async with httpx.AsyncClient(timeout=20) as c:
-        f = await c.get(file_url)
-        f.raise_for_status()
-        return f.content
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
+        r2 = await client.get(file_url)
+        r2.raise_for_status()
+        return r2.content
+
+
+# -------------------- HuggingFace Detection --------------------
+async def get_hf_score(image_bytes: bytes) -> float:
+    url = "https://api-inference.huggingface.co/models/Falconsai/nsfw-detector"
+
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Accept": "application/json"
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(url, headers=headers, files={
+            "file": ("image.jpg", image_bytes, "image/jpeg")
+        })
+
+    # If HF returned HTML => ERROR
+    if resp.headers.get("content-type", "").startswith("text/html"):
+        logger.error("HF returned HTML → wrong token or model busy")
+        return 0.0
+
+    try:
+        data = resp.json()
+    except:
+        logger.error("HF returned non-JSON")
+        return 0.0
+
+    # Extract highest NSFW score
+    best = 0.0
+    for item in data:
+        label = item.get("label", "").lower()
+        score = float(item.get("score", 0.0))
+
+        if label in ["porn", "sexy", "nsfw", "hentai", "explicit"]:
+            if score > best:
+                best = score
+
+    return best
 
 
 # -------------------- Main Image Handler --------------------
-async def process_image(message: types.Message):
-    chat = message.chat
-    user = message.from_user
+async def handle_image(msg: types.Message):
+    user = msg.from_user
+    chat = msg.chat
 
+    # Download image
     try:
-        if message.photo:
-            file_id = message.photo[-1].file_id
-        elif message.document and (message.document.mime_type or "").startswith("image"):
-            file_id = message.document.file_id
+        if msg.photo:
+            file_id = msg.photo[-1].file_id
+        elif msg.document and (msg.document.mime_type or "").startswith("image"):
+            file_id = msg.document.file_id
         else:
             return
+
+        img = await download_file(file_id)
+
     except:
+        logger.exception("Failed to download Telegram image")
         return
 
-    try:
-        img_bytes = await tg_download(file_id)
-    except Exception:
-        logger.exception("Failed to download telegram image")
-        return
-
-    score = await get_hf_score(img_bytes)
+    # HF Score
+    score = await get_hf_score(img)
     logger.info(f"Score={score:.3f} user={user.id} chat={chat.id}")
 
-    if score < NSFW_THRESHOLD:
-        return  # safe image
-
-    # Delete message
-    try:
-        await bot.delete_message(chat.id, message.message_id)
-    except:
-        logger.exception("Failed to delete NSFW image")
-
-    # Offense tracking
-    offenses = add_offense(chat.id, user.id)
-
-    # Mute permanently
-    try:
-        await bot.restrict_chat_member(
-            chat.id,
-            user.id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=PERMANENT_UNTIL
-        )
-        mark_muted(chat.id, user.id)
-    except:
-        logger.exception("Mute failed")
-
-    # Notify owner
-    if OWNER_CHAT_ID:
+    if score >= NSFW_THRESHOLD:
+        # Delete image
         try:
-            await bot.send_message(
-                OWNER_CHAT_ID,
-                f"🚫 NSFW Detected\n"
-                f"👤 User: <a href='tg://user?id={user.id}'>{user.full_name}</a>\n"
-                f"💬 Chat: {chat.title or chat.id}\n"
-                f"🔥 Score: {score:.3f}\n"
-                f"⚠️ Offenses: {offenses}"
+            await bot.delete_message(chat.id, msg.message_id)
+        except:
+            logger.error("Delete failed")
+
+        offenses = add_offense(chat.id, user.id)
+
+        # Mute permanently
+        try:
+            await bot.restrict_chat_member(
+                chat.id,
+                user.id,
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media_messages=False,
+                    can_send_other_messages=False
+                ),
+                until_date=PERMANENT_UNTIL,
             )
         except:
-            pass
+            logger.error("Mute failed")
+
+        # Notify owner
+        if OWNER_CHAT_ID:
+            await bot.send_message(
+                OWNER_CHAT_ID,
+                f"⚠️ NSFW detected\nUser: <a href='tg://user?id={user.id}'>{user.id}</a>\nScore: {score:.3f}\nOffenses: {offenses}"
+            )
 
 
 # -------------------- Handlers --------------------
 @dp.message(F.content_type == ContentType.PHOTO)
-async def on_photo(message: types.Message):
-    await process_image(message)
-
+async def photo(msg: types.Message):
+    await handle_image(msg)
 
 @dp.message(F.content_type == ContentType.DOCUMENT)
-async def on_doc(message: types.Message):
-    if message.document.mime_type.startswith("image"):
-        await process_image(message)
-
+async def doc(msg: types.Message):
+    if msg.document.mime_type.startswith("image"):
+        await handle_image(msg)
 
 @dp.message(Command("start"))
-async def on_start(message: types.Message):
-    await message.reply("🤖 NSFW Scanner active.\nSend an image to test.")
-
-
-@dp.message(Command("status"))
-async def status(message: types.Message):
-    if message.from_user.id != OWNER_CHAT_ID:
-        return await message.reply("Unauthorized.")
-    await message.reply("Bot running.")
-
+async def start(msg: types.Message):
+    await msg.reply("NSFW Scanner active ✔️")
 
 @dp.message(Command("unmute"))
-async def unmute(message: types.Message):
-    if message.from_user.id != OWNER_CHAT_ID:
-        return await message.reply("Only owner can unmute.")
+async def unmute(msg: types.Message):
+    if msg.from_user.id != OWNER_CHAT_ID:
+        return await msg.reply("Not authorized")
 
-    if not message.reply_to_message:
-        return await message.reply("Reply to a user's message with /unmute")
+    # reply-based unmute
+    if msg.reply_to_message:
+        user = msg.reply_to_message.from_user
+        chat = msg.chat
 
-    user_id = message.reply_to_message.from_user.id
-    chat_id = message.chat.id
+        try:
+            await bot.restrict_chat_member(
+                chat.id,
+                user.id,
+                permissions=ChatPermissions(
+                    can_send_messages=True,
+                    can_send_media_messages=True,
+                    can_send_other_messages=True
+                ),
+                until_date=None
+            )
+            reset_user(chat.id, user.id)
+            return await msg.reply(f"Unmuted {user.id}")
 
-    try:
-        await bot.restrict_chat_member(
-            chat_id,
-            user_id,
-            permissions=ChatPermissions(can_send_messages=True),
-            until_date=None
-        )
-        cur = _conn.cursor()
-        cur.execute("UPDATE offenders SET muted=0, offenses=0 WHERE chat_id=? AND user_id=?",
-                    (chat_id, user_id))
-        _conn.commit()
+        except:
+            return await msg.reply("Failed to unmute")
 
-        await message.reply(f"User {user_id} is now unmuted.")
-    except:
-        await message.reply("Failed to unmute.")
+    await msg.reply("Reply to the user's message with /unmute")
 
 
-# -------------------- Start Bot --------------------
+# -------------------- Start --------------------
 async def main():
+    logger.info("Bot running...")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
