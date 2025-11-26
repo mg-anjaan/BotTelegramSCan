@@ -1,7 +1,6 @@
 fastapi==0.95.2
-uvicorn==0.22.0
-pillow==10.0.0
-numpy==1.26.0
-httpx==0.24.1
-# Optional heavy dependency (only if you use ONNX model):
+uvicorn[standard]==0.22.0
 onnxruntime==1.15.1
+numpy
+pillow
+aiohttp
