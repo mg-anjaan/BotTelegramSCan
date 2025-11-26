@@ -1,10 +1,10 @@
 # bot-service/bot.py
 """
-Telegram moderation bot (aiogram v3)
-- Downloads incoming images (photo/document) via Telegram getFile endpoint
-- Sends image bytes to MODEL_API_URL (Authorization: Bearer <MODEL_SECRET>)
+Robust NSFW moderation Telegram bot (aiogram v3)
+- Reliable file download via Telegram getFile endpoint
+- Calls model at MODEL_API_URL (/score) with Authorization Bearer MODEL_SECRET
 - If score >= NSFW_THRESHOLD -> delete message, mute user permanently, log offense
-- Notifies OWNER_CHAT_ID about actions and model errors
+- Defensive error handling so single handler exceptions don't stop processing
 """
 import os
 import io
@@ -18,7 +18,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import ChatPermissions
 from aiogram import F
 from aiogram.enums import ContentType
-from aiogram.filters import Command  # correct for aiogram v3
+from aiogram.filters import Command
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -26,12 +26,11 @@ logger = logging.getLogger("nsfw-moderator")
 
 # ---------- config from env ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MODEL_API_URL = os.getenv("MODEL_API_URL")  # e.g. https://your-model.up.railway.app/score
+MODEL_API_URL = os.getenv("MODEL_API_URL")  # e.g. https://surprising-communication-production.up.railway.app/score
 MODEL_SECRET = os.getenv("MODEL_SECRET", "")
 NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.65"))
 MUTE_DAYS = int(os.getenv("MUTE_DAYS", "9999"))
 OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0") or 0)
-PORT = int(os.getenv("PORT", "8000"))
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN is not set. Exiting.")
@@ -66,38 +65,49 @@ _conn.commit()
 
 
 def add_offense(chat_id: int, user_id: int) -> int:
-    cur = _conn.cursor()
-    cur.execute("SELECT id, offenses FROM offenders WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-    row = cur.fetchone()
-    if row:
-        _id, offenses = row
-        offenses += 1
-        cur.execute("UPDATE offenders SET offenses=?, last_offense_ts=strftime('%s','now') WHERE id=?", (offenses, _id))
-    else:
-        offenses = 1
-        cur.execute("INSERT INTO offenders (chat_id,user_id,offenses) VALUES (?,?,?)", (chat_id, user_id, offenses))
-    _conn.commit()
-    return offenses
+    try:
+        cur = _conn.cursor()
+        cur.execute("SELECT id, offenses FROM offenders WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        row = cur.fetchone()
+        if row:
+            _id, offenses = row
+            offenses += 1
+            cur.execute("UPDATE offenders SET offenses=?, last_offense_ts=strftime('%s','now') WHERE id=?", (offenses, _id))
+        else:
+            offenses = 1
+            cur.execute("INSERT INTO offenders (chat_id,user_id,offenses) VALUES (?,?,?)", (chat_id, user_id, offenses))
+        _conn.commit()
+        return offenses
+    except Exception:
+        logger.exception("DB error in add_offense")
+        return 0
 
 
 def mark_muted(chat_id: int, user_id: int):
-    cur = _conn.cursor()
-    cur.execute("UPDATE offenders SET muted=1 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-    _conn.commit()
+    try:
+        cur = _conn.cursor()
+        cur.execute("UPDATE offenders SET muted=1 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        _conn.commit()
+    except Exception:
+        logger.exception("DB error in mark_muted")
 
 
 def get_offenses(chat_id: int, user_id: int) -> int:
-    cur = _conn.cursor()
-    cur.execute("SELECT offenses FROM offenders WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-    row = cur.fetchone()
-    return row[0] if row else 0
+    try:
+        cur = _conn.cursor()
+        cur.execute("SELECT offenses FROM offenders WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        row = cur.fetchone()
+        return row[0] if row else 0
+    except Exception:
+        logger.exception("DB error in get_offenses")
+        return 0
 
 
 # ---------- bot setup ----------
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-# permanent until (year 2038 safe int)
+# large until_date to approximate permanent mute
 PERMANENT_UNTIL = 2147483647
 
 
@@ -107,7 +117,6 @@ async def download_file_bytes(file_id: str, timeout: float = 30.0) -> bytes:
     Uses Telegram Bot API getFile -> download file via file path.
     Returns raw bytes of the file.
     """
-    # Step 1: get file_path
     getfile_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.get(getfile_url, params={"file_id": file_id})
@@ -119,7 +128,6 @@ async def download_file_bytes(file_id: str, timeout: float = 30.0) -> bytes:
     if not file_path:
         raise RuntimeError("getFile returned empty file_path")
 
-    # Step 2: download actual file content
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
     async with httpx.AsyncClient(timeout=timeout) as client:
         file_resp = await client.get(file_url)
@@ -140,161 +148,180 @@ async def get_image_score(image_bytes: bytes, filename: str = "image.jpg", timeo
 
 # ---------- image handler logic ----------
 async def handle_media(message: types.Message):
-    user = message.from_user
-    chat = message.chat
-
-    # download image bytes from photo or document using download_file_bytes helper
-    image_bytes = None
-    filename = "image.jpg"
+    """Main logic for processing an incoming image/document (image)."""
     try:
-        if message.photo:
-            # use the highest resolution photo's file_id
-            file_id = message.photo[-1].file_id
-            image_bytes = await download_file_bytes(file_id)
-            filename = "photo.jpg"
-        elif message.document and (message.document.mime_type or "").startswith("image"):
-            file_id = message.document.file_id
-            image_bytes = await download_file_bytes(file_id)
-            filename = message.document.file_name or "document.jpg"
-        else:
-            # not an image, ignore
-            return
-    except Exception:
-        logger.exception("Failed to download file from Telegram")
-        # optional: notify owner on repeated errors
-        if OWNER_CHAT_ID:
-            try:
-                await bot.send_message(OWNER_CHAT_ID, f"Failed to download file from Telegram for chat {chat.id}. See logs.")
-            except Exception:
-                pass
-        return
+        user = message.from_user
+        chat = message.chat
 
-    if not image_bytes:
-        logger.warning("No image bytes found, skipping")
-        return
-
-    # call model API
-    try:
-        score = await get_image_score(image_bytes, filename=filename)
-    except httpx.HTTPStatusError as e:
-        logger.error("Model API returned status %s: %s", e.response.status_code, e.response.text)
-        if OWNER_CHAT_ID:
-            try:
-                await bot.send_message(OWNER_CHAT_ID, f"Model API error: {e.response.status_code} {e.response.text}")
-            except Exception:
-                pass
-        return
-    except Exception as e:
-        logger.exception("Failed to call model API")
-        if OWNER_CHAT_ID:
-            try:
-                await bot.send_message(OWNER_CHAT_ID, f"Model API call failed: {e}")
-            except Exception:
-                pass
-        return
-
-    logger.info("Score for chat=%s user=%s msg=%s -> %.3f", chat.id, user.id, message.message_id, score)
-
-    if score >= NSFW_THRESHOLD:
-        # delete the message
+        # download image bytes
+        image_bytes = None
+        filename = "image.jpg"
         try:
-            await bot.delete_message(chat.id, message.message_id)
+            if message.photo:
+                file_id = message.photo[-1].file_id
+                image_bytes = await download_file_bytes(file_id)
+                filename = "photo.jpg"
+            elif message.document and (message.document.mime_type or "").startswith("image"):
+                file_id = message.document.file_id
+                image_bytes = await download_file_bytes(file_id)
+                filename = message.document.file_name or "document.jpg"
+            else:
+                # not an image - nothing to do
+                return
         except Exception:
-            logger.exception("Failed to delete message (permission?)")
-
-        # increment offenses
-        offenses = add_offense(chat.id, user.id)
-
-        # attempt to mute permanently
-        try:
-            await bot.restrict_chat_member(
-                chat_id=chat.id,
-                user_id=user.id,
-                permissions=ChatPermissions(
-                    can_send_messages=False,
-                    can_send_media_messages=False,
-                    can_send_other_messages=False,
-                    can_add_web_page_previews=False,
-                ),
-                until_date=PERMANENT_UNTIL,
-            )
-            mark_muted(chat.id, user.id)
-        except Exception:
-            logger.exception("Failed to restrict/mute user (bot may need admin)")
+            logger.exception("Failed to download file from Telegram")
             if OWNER_CHAT_ID:
                 try:
-                    await bot.send_message(OWNER_CHAT_ID, f"Need admin to mute user {user.id} in chat {chat.id}.")
+                    await bot.send_message(OWNER_CHAT_ID, f"Failed to download file for chat {chat.id}; see logs.")
                 except Exception:
                     pass
+            return
 
-        # notify owner
-        if OWNER_CHAT_ID:
+        if not image_bytes:
+            logger.warning("No image bytes found, skipping")
+            return
+
+        # Call model
+        try:
+            score = await get_image_score(image_bytes, filename=filename)
+        except httpx.HTTPStatusError as e:
+            logger.error("Model API returned status %s: %s", e.response.status_code, e.response.text)
+            if OWNER_CHAT_ID:
+                try:
+                    await bot.send_message(OWNER_CHAT_ID, f"Model API error: {e.response.status_code} {e.response.text}")
+                except Exception:
+                    pass
+            return
+        except Exception:
+            logger.exception("Failed to call model API")
+            if OWNER_CHAT_ID:
+                try:
+                    await bot.send_message(OWNER_CHAT_ID, "Model API call failed; check logs.")
+                except Exception:
+                    pass
+            return
+
+        logger.info("Score for chat=%s user=%s msg=%s -> %.3f", chat.id, user.id, message.message_id, score)
+
+        if score >= NSFW_THRESHOLD:
+            # delete message
             try:
-                chat_title = chat.title or str(chat.id)
-                await bot.send_message(
-                    OWNER_CHAT_ID,
-                    f"Muted user <a href='tg://user?id={user.id}'>{user.id}</a> in {chat_title}\nscore={score:.3f}\noffenses={offenses}",
-                )
+                await bot.delete_message(chat.id, message.message_id)
             except Exception:
-                pass
-    else:
-        logger.debug("Image OK (score %.3f) for user %s in chat %s", score, user.id, chat.id)
+                logger.exception("Failed to delete message (permission?)")
+
+            # increment offenses
+            offenses = add_offense(chat.id, user.id)
+
+            # attempt to mute permanently
+            try:
+                await bot.restrict_chat_member(
+                    chat_id=chat.id,
+                    user_id=user.id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_media_messages=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                    ),
+                    until_date=PERMANENT_UNTIL,
+                )
+                mark_muted(chat.id, user.id)
+            except Exception:
+                logger.exception("Failed to restrict/mute user (bot may need admin)")
+                if OWNER_CHAT_ID:
+                    try:
+                        await bot.send_message(OWNER_CHAT_ID, f"Need admin to mute user {user.id} in chat {chat.id}.")
+                    except Exception:
+                        pass
+
+            # notify owner
+            if OWNER_CHAT_ID:
+                try:
+                    chat_title = chat.title or str(chat.id)
+                    await bot.send_message(
+                        OWNER_CHAT_ID,
+                        f"Muted user <a href='tg://user?id={user.id}'>{user.id}</a> in {chat_title}\nscore={score:.3f}\noffenses={offenses}",
+                    )
+                except Exception:
+                    logger.exception("Failed to notify owner about mute")
+        else:
+            logger.debug("Image OK (score %.3f) for user %s in chat %s", score, user.id, chat.id)
+    except Exception:
+        # Catch-all to prevent one update from killing the worker
+        logger.exception("Unexpected error in handle_media")
 
 
-# ---------- handlers ----------
+# ---------- handlers (defensive) ----------
 @dp.message(F.content_type == ContentType.PHOTO)
 async def photo_handler(message: types.Message):
-    await handle_media(message)
+    try:
+        await handle_media(message)
+    except Exception:
+        logger.exception("photo_handler error")
 
 
 @dp.message(F.content_type == ContentType.DOCUMENT)
 async def document_handler(message: types.Message):
-    if message.document and (message.document.mime_type or "").startswith("image"):
-        await handle_media(message)
+    try:
+        if message.document and (message.document.mime_type or "").startswith("image"):
+            await handle_media(message)
+    except Exception:
+        logger.exception("document_handler error")
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.reply("NSFW moderation bot active. I delete vulgar images and mute offenders.")
+    try:
+        await message.reply("NSFW moderation bot active. I delete vulgar images and mute offenders.")
+    except Exception:
+        logger.exception("cmd_start reply failed")
 
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
-    if message.from_user and message.from_user.id == OWNER_CHAT_ID:
-        await message.reply("Bot is running.")
-    else:
-        await message.reply("You are not authorized.")
+    try:
+        if message.from_user and message.from_user.id == OWNER_CHAT_ID:
+            await message.reply("Bot is running.")
+        else:
+            await message.reply("You are not authorized.")
+    except Exception:
+        logger.exception("cmd_status reply failed")
 
 
 @dp.message(Command("unmute"))
 async def cmd_unmute(message: types.Message):
-    if message.from_user and message.from_user.id != OWNER_CHAT_ID:
-        await message.reply("Only owner can use this command.")
-        return
-    parts = message.text.split()
-    if len(parts) < 3:
-        await message.reply("Usage: /unmute <chat_id> <user_id>")
-        return
     try:
-        chat_id = int(parts[1])
-        user_id = int(parts[2])
-    except ValueError:
-        await message.reply("Chat ID and User ID must be integers.")
-        return
-    try:
-        await bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-            permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True),
-            until_date=None,
-        )
-        cur = _conn.cursor()
-        cur.execute("UPDATE offenders SET muted=0, offenses=0 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        _conn.commit()
-        await message.reply(f"User {user_id} unmuted in chat {chat_id}.")
+        if message.from_user and message.from_user.id != OWNER_CHAT_ID:
+            await message.reply("Only owner can use this command.")
+            return
+        parts = message.text.split()
+        if len(parts) < 3:
+            # Escape angle brackets so global HTML parse_mode doesn't fail
+            await message.reply("Usage: /unmute &lt;chat_id&gt; &lt;user_id&gt;")
+            return
+        try:
+            chat_id = int(parts[1])
+            user_id = int(parts[2])
+        except ValueError:
+            await message.reply("Chat ID and User ID must be integers.")
+            return
+        try:
+            await bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True),
+                until_date=None,
+            )
+            cur = _conn.cursor()
+            cur.execute("UPDATE offenders SET muted=0, offenses=0 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+            _conn.commit()
+            await message.reply(f"User {user_id} unmuted in chat {chat_id}.")
+        except Exception:
+            logger.exception("Failed to unmute user")
+            await message.reply("Failed to unmute (bot needs admin or invalid IDs).")
     except Exception:
-        logger.exception("Failed to unmute user")
-        await message.reply("Failed to unmute (bot needs admin or invalid IDs).")
+        logger.exception("cmd_unmute unexpected error")
 
 
 # ---------- start polling ----------
@@ -302,8 +329,13 @@ async def main():
     try:
         logger.info("Starting bot polling...")
         await dp.start_polling(bot)
+    except Exception:
+        logger.exception("Dispatcher failed")
     finally:
-        await bot.session.close()
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
