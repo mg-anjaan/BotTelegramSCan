@@ -1,79 +1,83 @@
-# model-service/app.py
+# app.py
 import io
 import logging
 import os
+from typing import Dict
+
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.responses import JSONResponse
 from PIL import Image
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("nsfw-service")
+logger = logging.getLogger("nsfw-model-service")
 
-# read secret from env
-MODEL_SECRET = os.environ.get("MODEL_SECRET", "mgPROTECT12345")
+# Config
+MODEL_API_KEY = os.getenv("MODEL_API_KEY", "mgmodelsecret123")
+MODEL_TYPE = os.getenv("MODEL_TYPE", "dummy")  # "onnx" or "dummy"
+MODEL_PATH = os.getenv("MODEL_PATH", "/app/model.onnx")
+# thresholds not used by service but helpful for local tests
+GENITAL_THRESHOLD = float(os.getenv("GENITAL_THRESHOLD", "0.70"))
+BREAST_THRESHOLD = float(os.getenv("BREAST_THRESHOLD", "0.70"))
 
-# try to import a model loader that exposes nsfw_model.classify(img) -> float
+# Attempt to import/load model wrapper
 try:
-    from model_loader import nsfw_model
-except Exception:
-    logger.exception("Could not import model_loader or nsfw_model. Make sure model_loader.py exists.")
-    # Allow app to start but any inference attempt will error clearly.
-    nsfw_model = None
+    from model_loader import nsfw_model  # must expose classify(PIL.Image) -> dict
+except Exception as e:
+    logger.exception("Failed to import model_loader (service will fail). Exception:")
+    raise
 
-app = FastAPI(title="NSFW model service")
-
+app = FastAPI(title="NSFW model service (score + categories)")
 
 @app.get("/ping")
 async def ping():
     return {"status": "ok", "service": "nsfw-model"}
 
-
 @app.post("/score")
 async def score(image: UploadFile = File(...), authorization: str = Header(None)):
     """
-    Accepts multipart/form-data file "image".
-    Header: Authorization: Bearer <MODEL_SECRET>
-    Returns: {"score": 0.87}
+    Headers:
+      Authorization: Bearer <MODEL_API_KEY>
+
+    Returns JSON:
+      {"score": 0.87, "genitals": 0.83, "breasts": 0.12, "skin_ratio": 0.24}
     """
-    # Check header
-    if authorization is None:
-        logger.warning("Unauthorized request (missing Authorization header)")
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-
-    if not authorization.startswith("Bearer "):
-        logger.warning("Unauthorized request (invalid Authorization header format)")
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
-
-    token = authorization.split(" ", 1)[1].strip()
-    if token != MODEL_SECRET:
-        logger.warning("Unauthorized request (invalid API key)")
+    # Auth
+    if authorization != f"Bearer {MODEL_API_KEY}":
+        logger.warning("Unauthorized request (missing/invalid API key)")
         raise HTTPException(status_code=401, detail="Invalid API key")
 
+    # Read image
     contents = await image.read()
     if not contents:
         logger.warning("Empty file uploaded")
         raise HTTPException(status_code=400, detail="Empty file")
 
     try:
-        img = Image.open(io.BytesIO(contents)).convert("RGB")
+        pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
     except Exception:
         logger.exception("Failed to parse uploaded image")
         raise HTTPException(status_code=400, detail="Invalid image file")
 
-    if nsfw_model is None:
-        logger.error("Model not loaded")
-        raise HTTPException(status_code=500, detail="Model not loaded")
-
+    # Run model wrapper; expect dict (score, genitals, breasts, skin_ratio)
     try:
-        score_val = nsfw_model.classify(img)  # expects numeric
+        out = nsfw_model.classify(pil_img)
+    except AttributeError:
+        logger.exception("nsfw_model has no 'classify' method. Check model_loader.")
+        raise HTTPException(status_code=500, detail="Model not callable")
     except Exception:
         logger.exception("Model inference failed")
         raise HTTPException(status_code=500, detail="Model inference error")
 
-    try:
-        score_float = float(score_val)
-    except Exception:
-        logger.exception("Model returned non-numeric score")
+    # Validate output
+    if not isinstance(out, dict):
+        logger.error("Model returned invalid output (not a dict): %r", out)
         raise HTTPException(status_code=500, detail="Invalid model output")
 
-    return JSONResponse({"score": score_float})
+    # Normalize keys
+    score = float(out.get("score", 0.0))
+    genitals = float(out.get("genitals", 0.0))
+    breasts = float(out.get("breasts", 0.0))
+    skin_ratio = float(out.get("skin_ratio", 0.0))
+
+    resp = {"score": score, "genitals": genitals, "breasts": breasts, "skin_ratio": skin_ratio}
+    return JSONResponse(resp)
