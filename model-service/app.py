@@ -1,4 +1,5 @@
-# model-service/app.py
+# model-service/app.py  (REPLACE your current file with this)
+import os
 import io
 import logging
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header
@@ -9,20 +10,17 @@ from PIL import Image
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nsfw-service")
 
+# Load API key from environment (fall back to a debug default only if not set)
+MODEL_API_KEY = os.getenv("MODEL_API_KEY", "mgPROTECT123")
+
 # Attempt import of your model module with clear error if wrong
 try:
-    # <-- CORRECT import: no ".py" extension here
     from model_loader import nsfw_model
 except Exception as e:
-    # Log and re-raise so the container startup fails visibly in logs
     logger.exception("Failed to import nsfw model (check model_loader.py). Exception:")
-    # Re-raise to stop startup (uvicorn will show the stacktrace in logs)
     raise
 
 app = FastAPI(title="NSFW model service")
-
-# API key used by your tests (keep in sync with tests / curl header)
-MODEL_API_KEY = "mgPROTECT123"
 
 
 @app.get("/ping")
@@ -38,9 +36,13 @@ async def score(image: UploadFile = File(...), authorization: str = Header(None)
     Header: Authorization: Bearer <KEY>
     Returns: {"score": 0.87}
     """
-    # Auth
-    if authorization != f"Bearer {MODEL_API_KEY}":
-        logger.warning("Unauthorized request (missing/invalid API key)")
+    # Auth — allow header forms like "Bearer <KEY>"
+    if not authorization or not authorization.startswith("Bearer "):
+        logger.warning("Unauthorized request (missing Authorization header)")
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    token = authorization.split(" ", 1)[1]
+    if token != MODEL_API_KEY:
+        logger.warning("Unauthorized request (invalid API key)")
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     # Read image bytes
@@ -52,17 +54,23 @@ async def score(image: UploadFile = File(...), authorization: str = Header(None)
     # Try to load image using Pillow
     try:
         img = Image.open(io.BytesIO(contents)).convert("RGB")
-    except Exception as exc:
+    except Exception:
         logger.exception("Failed to parse uploaded image")
         raise HTTPException(status_code=400, detail="Invalid image file")
 
-    # Run the classifier — adapt if your model API differs
+    # Run the classifier — support both predict() and classify()
     try:
-        # expecting nsfw_model.classify(image) -> float or numeric
-        score_val = nsfw_model.classify(img)
-    except AttributeError:
-        logger.exception("nsfw_model has no 'classify' method. Check model_loader implementation.")
-        raise HTTPException(status_code=500, detail="Model not callable")
+        if hasattr(nsfw_model, "predict") and callable(getattr(nsfw_model, "predict")):
+            score_val = nsfw_model.predict(img)
+            logger.debug("Used nsfw_model.predict")
+        elif hasattr(nsfw_model, "classify") and callable(getattr(nsfw_model, "classify")):
+            score_val = nsfw_model.classify(img)
+            logger.debug("Used nsfw_model.classify")
+        else:
+            logger.error("nsfw_model has no 'predict' or 'classify' method. Check model_loader implementation.")
+            raise HTTPException(status_code=500, detail="Server misconfiguration: model method not found")
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Model inference failed")
         raise HTTPException(status_code=500, detail="Model inference error")
@@ -74,5 +82,11 @@ async def score(image: UploadFile = File(...), authorization: str = Header(None)
         logger.exception("Model returned non-numeric score")
         raise HTTPException(status_code=500, detail="Invalid model output")
 
-    return JSONResponse({"score": score_float})
+    # Clip to [0,1] just in case and return
+    if score_float < 0:
+        score_float = 0.0
+    elif score_float > 1:
+        score_float = 1.0
 
+    logger.info("Score returned: %.4f", score_float)
+    return JSONResponse({"score": score_float})
