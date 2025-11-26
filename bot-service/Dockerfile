@@ -1,28 +1,23 @@
-# Dockerfile (use this)
+# /bot-service/Dockerfile
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install OS deps required by Pillow, psycopg2-binary, build wheels etc.
+# system libs needed by Pillow etc.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    build-essential \
-    libpq-dev \
-    libffi-dev \
-    libjpeg62-turbo-dev \
-    zlib1g-dev \
+    gcc libffi-dev build-essential libjpeg62-turbo-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only requirements first for better caching
-COPY requirements.txt /app/
+# Copy and install bot-service requirements (explicit path)
+COPY bot-service/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-RUN pip install --upgrade pip setuptools wheel
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy app code
-COPY . /app
+# Copy bot-service source code
+COPY bot-service/ /app/
 
 ENV PYTHONUNBUFFERED=1
 
-# If your bot uses long-polling run bot.py; if you use webhooks or uvicorn change this
+# Railway sets PORT but bot doesn't serve HTTP; still include default
+ENV PORT=8000
+
 CMD ["python", "bot.py"]
