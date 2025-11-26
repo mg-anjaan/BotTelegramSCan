@@ -18,6 +18,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import ChatPermissions
 from aiogram import F
 from aiogram.enums import ContentType
+from aiogram.filters import Command  # correct filter for commands in aiogram v3
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -96,7 +97,6 @@ def get_offenses(chat_id: int, user_id: int) -> int:
 # ---------- bot setup ----------
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
-
 
 # permanent until (year 2038 safe int)
 PERMANENT_UNTIL = 2147483647
@@ -227,12 +227,12 @@ async def document_handler(message: types.Message):
         await handle_media(message)
 
 
-@dp.message(commands=["start"])
+@dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.reply("NSFW moderation bot active. I delete vulgar images and mute offenders.")
 
 
-@dp.message(commands=["status"])
+@dp.message(Command("status"))
 async def cmd_status(message: types.Message):
     # owner-only
     if message.from_user and message.from_user.id == OWNER_CHAT_ID:
@@ -241,7 +241,7 @@ async def cmd_status(message: types.Message):
         await message.reply("You are not authorized.")
 
 
-@dp.message(commands=["unmute"])
+@dp.message(Command("unmute"))
 async def cmd_unmute(message: types.Message):
     # owner-only: /unmute <chat_id> <user_id>
     if message.from_user and message.from_user.id != OWNER_CHAT_ID:
